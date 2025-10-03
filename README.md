@@ -1,4 +1,4 @@
-g# Switch Transformer Text Classifier
+# Switch Transformer Text Classifier
 
 Bring the routing magic of Switch Transformers to lightweight text classification experiments. This repo implements a compact Mixture-of-Experts transformer encoder that you can train on synthetic data or popular HuggingFace corpora, then run fast inference to inspect predictions.
 
