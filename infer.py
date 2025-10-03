@@ -102,7 +102,16 @@ def run_inference(args):
 
     if args.ckpt is not None:
         print(f"Loading checkpoint from {args.ckpt}")
-        model.load_state_dict(torch.load(args.ckpt, map_location=device))
+        checkpoint = torch.load(args.ckpt, map_location=device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            if args.use_ema and "ema_state_dict" in checkpoint:
+                state_dict = checkpoint["ema_state_dict"]
+                print("Loaded EMA weights from checkpoint")
+            else:
+                state_dict = checkpoint["model_state_dict"]
+            model.load_state_dict(state_dict)
+        else:
+            model.load_state_dict(checkpoint)
 
     model.eval()
 
@@ -168,6 +177,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
         "--ckpt", type=str, default=None, help="Path to model checkpoint (.pt file)"
+    )
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="When loading trainer checkpoints, prefer EMA weights if available",
     )
 
     args = parser.parse_args()

@@ -1,4 +1,6 @@
 import argparse
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -99,6 +101,44 @@ def _build_amp_components(device: torch.device, requested_amp: bool):
         return cuda_autocast(enabled=enabled)
 
     return scaler, autocast_factory
+
+
+def _ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _checkpoint_state(
+    model: nn.Module,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    step: int,
+    args,
+    metric: float,
+):
+    state = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "global_step": step,
+        "best_metric": metric,
+        "args": vars(args),
+    }
+    if scheduler is not None:
+        state["scheduler_state_dict"] = scheduler.state_dict()
+    if hasattr(scaler, "is_enabled") and scaler.is_enabled():
+        state["scaler_state_dict"] = scaler.state_dict()
+    ema_state = getattr(model, "ema_state_dict", None)
+    if ema_state is not None:
+        state["ema_state_dict"] = ema_state
+    return state
+
+
+def _save_checkpoint(state: dict, ckpt_path: Path, label: str):
+    _ensure_dir(ckpt_path.parent)
+    torch.save(state, ckpt_path)
+    print(f"Checkpoint saved -> {label}: {ckpt_path}")
 
 
 class ExponentialMovingAverage:
@@ -258,6 +298,7 @@ def train_classifier(args):
         dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn
     )
 
+    dataset_size = len(dataset)
     if hasattr(dataset, "lengths") and dataset.lengths is not None:
         lengths = dataset.lengths.to(torch.float32)
         avg_len = float(lengths.mean().item())
@@ -326,6 +367,10 @@ def train_classifier(args):
         ExponentialMovingAverage(model, args.ema_decay) if args.ema_decay > 0 else None
     )
 
+    ckpt_dir = Path(args.checkpoint_dir).expanduser() if args.checkpoint_dir else None
+    save_every = max(1, args.save_every) if args.save_every > 0 else None
+    best_metric = float("-inf")
+
     history_loss, history_acc = [], []
     routing_drop_sum = 0.0
     routing_load_std_sum = 0.0
@@ -335,7 +380,8 @@ def train_classifier(args):
 
     for epoch in range(args.epochs):
         model.train()
-        total_loss, total_acc = 0, 0
+        total_loss = 0.0
+        total_correct = 0
         batch_iter = (
             dataloader
             if tqdm is None
@@ -343,7 +389,7 @@ def train_classifier(args):
         )
         for batch in batch_iter:
             input_ids, attention_mask, labels = [b.to(device) for b in batch]
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             with autocast_factory(enabled=amp_enabled):
                 logits, aux_loss = model(input_ids, attention_mask=attention_mask)
                 cls_loss = criterion(logits, labels)
@@ -371,9 +417,10 @@ def train_classifier(args):
                 ema.update(model)
             global_step += 1
 
-            total_loss += loss_value * input_ids.size(0)
+            batch_size = input_ids.size(0)
+            total_loss += loss_value * batch_size
             preds = logits.argmax(dim=-1)
-            total_acc += (preds == labels).sum().item()
+            total_correct += (preds == labels).sum().item()
 
             layer_stats = model.latest_routing_metrics()
             for stat in layer_stats:
@@ -389,14 +436,36 @@ def train_classifier(args):
                 routing_records += 1
 
             if tqdm is not None:
-                batch_iter.set_postfix(loss=f"{loss.item():.4f}")
+                batch_iter.set_postfix(loss=f"{loss_value:.4f}")
 
-        avg_loss = total_loss / len(dataset)
-        avg_acc = total_acc / len(dataset)
+        avg_loss = total_loss / dataset_size
+        avg_acc = total_correct / dataset_size
         history_loss.append(avg_loss)
         history_acc.append(avg_acc)
 
         print(f"Epoch {epoch + 1}: loss={avg_loss:.4f}, acc={avg_acc:.4f}")
+
+        epoch_metric = avg_acc
+        is_best = epoch_metric > best_metric
+        if is_best:
+            best_metric = epoch_metric
+
+        if ckpt_dir is not None and (
+            save_every is None or (epoch + 1) % save_every == 0 or is_best
+        ):
+            state = _checkpoint_state(
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch + 1,
+                step=global_step,
+                args=args,
+                metric=best_metric,
+            )
+            _save_checkpoint(state, ckpt_dir / "last.pt", "last")
+            if is_best:
+                _save_checkpoint(state, ckpt_dir / "best.pt", "best")
 
         if routing_records > 0:
             avg_drop = routing_drop_sum / routing_records
@@ -492,6 +561,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--ema_decay", type=float, default=0.0)
     parser.add_argument("--ema_start_step", type=int, default=100)
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Directory to save checkpoints (stores last.pt and best.pt)",
+    )
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=1,
+        help="Save checkpoint every N epochs when checkpoint_dir is set",
+    )
 
     args = parser.parse_args()
     train_classifier(args)

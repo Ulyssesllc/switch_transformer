@@ -96,6 +96,7 @@ python train.py --dataset ag_news --seq_len 128 --batch_size 32 --epochs 3
 Artifacts:
 - `training_curve.png` (if matplotlib is installed).
 - Standard output logs with loss/accuracy per epoch.
+- Optional checkpoints (`last.pt` / `best.pt`) when `--checkpoint_dir` is provided.
 > Optimization uses Adafactor with a relative-step schedule (requires `transformers>=4.0.0`).
 
 ### Key CLI switches (training)
@@ -125,6 +126,8 @@ Artifacts:
 | `--use_amp` | `False` | Enable mixed precision (prefers `torch.amp`, falls back to legacy `torch.cuda.amp`). |
 | `--ema_decay` | `0.0` | Apply EMA tracking to model weights (set >0 to enable). |
 | `--ema_start_step` | `100` | Step after which EMA updates begin. |
+| `--checkpoint_dir` | `None` | Save checkpoints (`last.pt`, `best.pt`) into this directory. |
+| `--save_every` | `1` | Save checkpoints every *N* epochs (in addition to best). |
 
 ---
 
@@ -134,10 +137,11 @@ Run inference on the toy dataset (random weights):
 python infer.py --dataset toy --num_samples 16 --batch_size 4
 ```
 
-Load a trained classifier checkpoint:
+Load a trained classifier checkpoint (automatically handles the trainer's `best.pt` / `last.pt` format):
 ```bash
 python infer.py --dataset ag_news --seq_len 128 --batch_size 8 --ckpt checkpoints/ag_news_best.pt
 ```
+Add `--use_ema` if you want to restore the Exponential Moving Average weights saved during training.
 
 Outputs show true vs. predicted labels and the first 60 characters of the original text for HuggingFace samples. The script currently prints only the first batch for readability.
 
@@ -155,6 +159,7 @@ Outputs show true vs. predicted labels and the first 60 characters of the origin
 | `--capacity_factor_eval` | `2.0` | Router capacity multiplier during inference. |
 | `--switch_dropout` | `0.1` | Router dropout kept consistent with training. |
 | `--z_loss_coef` | `1e-3` | Router z-loss coefficient (match training). |
+| `--use_ema` | `False` | Load EMA weights from trainer checkpoints when available. |
 
 ---
 
