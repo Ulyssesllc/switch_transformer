@@ -12,6 +12,7 @@ Bring the routing magic of Switch Transformers to lightweight text classificatio
 - **Toy dataset generator** for instant experimentation without external downloads.
 - **Plug-and-play HuggingFace integration** for `ag_news` and `sst2` (GLUE) with attention masks and raw text preservation.
 - **Matplotlib visualizations**—automatic loss/accuracy curves saved as `training_curve.png` when the library is available.
+- **Mixed-precision friendly** – prefers the modern `torch.amp` API and automatically downgrades to full precision if AMP is unavailable.
 - **CPU/GPU ready** using vanilla PyTorch APIs.
 
 ---
@@ -121,7 +122,7 @@ Artifacts:
 | `--adafactor_clip_threshold` | `1.0` | Internal Adafactor gradient clipping threshold. |
 | `--lr` | `None` | Provide a value to disable relative-step Adafactor and use a fixed LR. |
 | `--warmup_steps` | `0` | Linear warm-up steps for fixed-LR runs. |
-| `--use_amp` | `False` | Enable `torch.cuda.amp` mixed precision. |
+| `--use_amp` | `False` | Enable mixed precision (prefers `torch.amp`, falls back to legacy `torch.cuda.amp`). |
 | `--ema_decay` | `0.0` | Apply EMA tracking to model weights (set >0 to enable). |
 | `--ema_start_step` | `100` | Step after which EMA updates begin. |
 
@@ -171,6 +172,7 @@ Both commands succeed on CPU, creating `training_curve.png` and printing predict
 - **`ImportError: Please install transformers`** – install `transformers` and `datasets` via pip and re-run.
 - **`ImportError: Please install datasets`** – the HuggingFace loader is optional; stick to `--dataset toy` or install `datasets`.
 - **Matplotlib warnings** – the script switches to the `Agg` backend automatically; install `matplotlib` for curve exports or ignore the message.
+- **AMP requested but unavailable** – when running on CPU or older PyTorch builds, the trainer falls back to full precision and prints a one-time notice.
 - **Out-of-memory on GPU** – reduce `--batch_size`, `--seq_len`, or `--d_model`, or run on CPU.
 
 ---

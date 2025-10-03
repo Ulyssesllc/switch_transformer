@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
+from contextlib import nullcontext
 
 try:
     import matplotlib
@@ -33,6 +33,72 @@ try:
     from tqdm.auto import tqdm
 except ImportError:
     tqdm = None
+
+
+class _DisabledScaler:
+    """Fallback scaler used when AMP is unavailable."""
+
+    def __init__(self):
+        self._enabled = False
+
+    def is_enabled(self):
+        return False
+
+    def scale(self, loss):
+        return loss
+
+    def step(self, optimizer):
+        optimizer.step()
+
+    def update(self):
+        pass
+
+    def unscale_(self, optimizer):
+        pass
+
+
+def _build_amp_components(device: torch.device, requested_amp: bool):
+    """
+    Returns (scaler, autocast_factory) preferring torch.amp when available and
+    falling back to legacy torch.cuda.amp. When AMP cannot be enabled, returns
+    a disabled scaler and nullcontext factory.
+    """
+
+    if not requested_amp:
+        return _DisabledScaler(), lambda enabled=True: nullcontext()
+
+    torch_amp = getattr(torch, "amp", None)
+    if torch_amp is not None:
+        GradScalerCls = getattr(torch_amp, "GradScaler", None)
+        autocast_fn = getattr(torch_amp, "autocast", None)
+        if GradScalerCls is not None and autocast_fn is not None:
+            try:
+                scaler = GradScalerCls(device_type=device.type, enabled=True)
+            except TypeError:
+                scaler = GradScalerCls(enabled=True)
+
+            def autocast_factory(enabled=True):
+                try:
+                    return autocast_fn(device_type=device.type, enabled=enabled)
+                except TypeError:
+                    return autocast_fn(enabled=enabled)
+
+            return scaler, autocast_factory
+
+    try:
+        from torch.cuda.amp import (
+            GradScaler as CudaGradScaler,
+            autocast as cuda_autocast,
+        )  # type: ignore
+    except ImportError:
+        return _DisabledScaler(), lambda enabled=True: nullcontext()
+
+    scaler = CudaGradScaler(enabled=True)
+
+    def autocast_factory(enabled=True):
+        return cuda_autocast(enabled=enabled)
+
+    return scaler, autocast_factory
 
 
 class ExponentialMovingAverage:
@@ -225,8 +291,11 @@ def train_classifier(args):
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    use_amp = args.use_amp and device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
+    requested_amp = args.use_amp and device.type == "cuda"
+    scaler, autocast_factory = _build_amp_components(device, requested_amp)
+    amp_enabled = getattr(scaler, "is_enabled", lambda: False)()
+    if requested_amp and not amp_enabled:
+        print("AMP requested but unavailable; continuing in full precision")
 
     if Adafactor is None or AdafactorSchedule is None:
         raise ImportError(
@@ -275,14 +344,14 @@ def train_classifier(args):
         for batch in batch_iter:
             input_ids, attention_mask, labels = [b.to(device) for b in batch]
             optimizer.zero_grad()
-            with autocast(enabled=use_amp):
+            with autocast_factory(enabled=amp_enabled):
                 logits, aux_loss = model(input_ids, attention_mask=attention_mask)
                 cls_loss = criterion(logits, labels)
                 loss = cls_loss + aux_loss
 
             loss_value = loss.detach().item()
 
-            if use_amp:
+            if amp_enabled:
                 scaler.scale(loss).backward()
                 if args.grad_clip > 0:
                     scaler.unscale_(optimizer)
