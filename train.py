@@ -21,6 +21,11 @@ try:
 except ImportError:
     AutoTokenizer = None
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 class SwitchClassifier(nn.Module):
     def __init__(
@@ -157,7 +162,12 @@ def train_classifier(args):
     for epoch in range(args.epochs):
         model.train()
         total_loss, total_acc = 0, 0
-        for batch in dataloader:
+        batch_iter = (
+            dataloader
+            if tqdm is None
+            else tqdm(dataloader, desc=f"Epoch {epoch + 1}", leave=False)
+        )
+        for batch in batch_iter:
             input_ids, attention_mask, labels = [b.to(device) for b in batch]
             logits, aux_loss = model(input_ids, attention_mask=attention_mask)
 
@@ -171,6 +181,9 @@ def train_classifier(args):
             total_loss += loss.item() * input_ids.size(0)
             preds = logits.argmax(dim=-1)
             total_acc += (preds == labels).sum().item()
+
+            if tqdm is not None:
+                batch_iter.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_loss = total_loss / len(dataset)
         avg_acc = total_acc / len(dataset)
