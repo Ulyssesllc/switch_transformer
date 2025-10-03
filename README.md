@@ -1,4 +1,4 @@
-# Switch Transformer Text Classifier
+g# Switch Transformer Text Classifier
 
 Bring the routing magic of Switch Transformers to lightweight text classification experiments. This repo implements a compact Mixture-of-Experts transformer encoder that you can train on synthetic data or popular HuggingFace corpora, then run fast inference to inspect predictions.
 
@@ -7,6 +7,8 @@ Bring the routing magic of Switch Transformers to lightweight text classificatio
 ## 🌟 Highlights
 - **Switch-style MoE** encoder with configurable expert count, routing noise, and auxiliary load-balancing loss.
 - **T5-inspired attention stack** using RMSNorm and relative position bias (no absolute positional embeddings).
+- **Optional encoder–decoder path** with shared embeddings, relative-bias cross-attention, and SwitchFFN layers on both sides for seq2seq experiments.
+- **Distributed-ready routing**: experimental `all_to_all` strategy plus per-expert telemetry (drop rate, load balance, capacity usage) logged during training.
 - **Toy dataset generator** for instant experimentation without external downloads.
 - **Plug-and-play HuggingFace integration** for `ag_news` and `sst2` (GLUE) with attention masks and raw text preservation.
 - **Matplotlib visualizations**—automatic loss/accuracy curves saved as `training_curve.png` when the library is available.
@@ -71,8 +73,9 @@ switch_transformer/
 
 ## 🧠 Model overview
 - Multi-head self-attention encoder layers (`model/transformer.py`) with relative position bias and RMSNorm.
-- Switch Feed-Forward Network (`model/switch_ffn.py`) with top-1 expert routing, capacity factor, expert dropout, SwitchDrop, and auxiliary losses (load-balance + z-loss).
-- Token embeddings only (no absolute positions); temporal information flows through the relative bias module.
+- Transformer decoder stack mirroring the encoder (self-attention with causal masking + encoder–decoder attention) for optional generative tasks.
+- Switch Feed-Forward Network (`model/switch_ffn.py`) with top-1 expert routing, capacity factor, expert dropout, SwitchDrop, auxiliary losses (load-balance + z-loss), and experimental multi-device all-to-all dispatch.
+- Token embeddings only (no absolute positions); temporal information flows through the relative bias modules on both encoder and decoder.
 - Classification head that pools token representations with or without attention masks.
 
 ---
@@ -99,6 +102,8 @@ Artifacts:
 |----------|---------|-------------|
 | `--dataset` | `toy` | `toy`, `ag_news`, or `sst2`. |
 | `--seq_len` | `16` | Maximum sequence length (used for padding/truncation). |
+| `--tokenizer_name` | `bert-base-uncased` | HuggingFace tokenizer checkpoint to load for text datasets. |
+| `--hf_limit` | `None` | Subsample HuggingFace dataset to the first *N* examples (useful for quick smoke tests). |
 | `--d_model` | `128` | Transformer embedding dimension. |
 | `--num_layers` | `2` | Number of Transformer blocks. |
 | `--num_heads` | `4` | Attention heads per block. |
@@ -109,11 +114,16 @@ Artifacts:
 | `--aux_loss_coef` | `1e-2` | Load-balancing loss coefficient. |
 | `--switch_dropout` | `0.1` | Dropout applied to router inputs ("SwitchDrop"). |
 | `--z_loss_coef` | `1e-3` | Router z-loss stabilizer. |
+| `--distributed_strategy` | `none` | Choose `none` (single device) or `all_to_all` for experimental distributed routing. |
 | `--label_smoothing` | `0.1` | Cross-entropy label smoothing factor. |
 | `--grad_clip` | `1.0` | Global gradient clipping threshold (L2 norm). |
 | `--weight_decay` | `0.0` | Weight decay applied by Adafactor. |
 | `--adafactor_clip_threshold` | `1.0` | Internal Adafactor gradient clipping threshold. |
 | `--lr` | `None` | Provide a value to disable relative-step Adafactor and use a fixed LR. |
+| `--warmup_steps` | `0` | Linear warm-up steps for fixed-LR runs. |
+| `--use_amp` | `False` | Enable `torch.cuda.amp` mixed precision. |
+| `--ema_decay` | `0.0` | Apply EMA tracking to model weights (set >0 to enable). |
+| `--ema_start_step` | `100` | Step after which EMA updates begin. |
 
 ---
 
@@ -138,6 +148,9 @@ Outputs show true vs. predicted labels and the first 60 characters of the origin
 | `--num_samples` | `1000` | Toy dataset size if `--dataset toy`. |
 | `--num_classes` | `3` | Toy dataset class count. |
 | `--vocab_size` | `500` | Toy dataset vocabulary size. |
+| `--tokenizer_name` | `bert-base-uncased` | Tokenizer checkpoint for HuggingFace datasets. |
+| `--hf_limit` | `None` | Optional cap on HuggingFace evaluation samples. |
+| `--distributed_strategy` | `none` | Match the routing strategy used during training. |
 | `--capacity_factor_eval` | `2.0` | Router capacity multiplier during inference. |
 | `--switch_dropout` | `0.1` | Router dropout kept consistent with training. |
 | `--z_loss_coef` | `1e-3` | Router z-loss coefficient (match training). |
@@ -159,6 +172,14 @@ Both commands succeed on CPU, creating `training_curve.png` and printing predict
 - **`ImportError: Please install datasets`** – the HuggingFace loader is optional; stick to `--dataset toy` or install `datasets`.
 - **Matplotlib warnings** – the script switches to the `Agg` backend automatically; install `matplotlib` for curve exports or ignore the message.
 - **Out-of-memory on GPU** – reduce `--batch_size`, `--seq_len`, or `--d_model`, or run on CPU.
+
+---
+
+## 📊 Monitoring & telemetry
+- Training prints per-epoch routing diagnostics: token drop fraction, expert-load standard deviation, and capacity utilization.
+- Dataset loaders emit length statistics (average, maximum, and percentage hitting the maximum) so you can spot aggressive truncation early.
+- When `distributed_strategy=all_to_all`, routing statistics include the active world size; ensure `torch.distributed` is initialised before model construction.
+- An EMA state dict is stored on the trained model (`model.ema_state_dict`) when EMA tracking is enabled.
 
 ---
 

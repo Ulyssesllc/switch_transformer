@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import LambdaLR
 
 try:
     import matplotlib
@@ -33,6 +35,30 @@ except ImportError:
     tqdm = None
 
 
+class ExponentialMovingAverage:
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow = {
+            name: param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            shadow_param = self.shadow.get(name)
+            if shadow_param is None:
+                self.shadow[name] = param.detach().clone()
+                continue
+            shadow_param.mul_(self.decay).add_(param.detach(), alpha=1 - self.decay)
+
+    def state_dict(self):
+        return {name: tensor.clone() for name, tensor in self.shadow.items()}
+
+
 class SwitchClassifier(nn.Module):
     def __init__(
         self,
@@ -53,6 +79,8 @@ class SwitchClassifier(nn.Module):
         init_scale: float = 0.1,
         switch_dropout: float = 0.1,
         z_loss_coef: float = 1e-3,
+        distributed_strategy: str = "none",
+        moe_process_group=None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -75,6 +103,8 @@ class SwitchClassifier(nn.Module):
             max_relative_distance=max_len,
             switch_dropout=switch_dropout,
             z_loss_coef=z_loss_coef,
+            distributed_strategy=distributed_strategy,
+            moe_process_group=moe_process_group,
         )
 
         self.classifier = nn.Linear(d_model, num_classes)
@@ -100,6 +130,14 @@ class SwitchClassifier(nn.Module):
         logits = self.classifier(pooled)
         return logits, aux_loss
 
+    def latest_routing_metrics(self):
+        stats = []
+        for layer in self.encoder.layers:
+            ffn_stats = getattr(layer.ffn, "last_routing_stats", None)
+            if ffn_stats:
+                stats.append(ffn_stats)
+        return stats
+
 
 def train_classifier(args):
     # dataset
@@ -112,6 +150,7 @@ def train_classifier(args):
         )
         num_classes = args.num_classes
         vocab_size = args.vocab_size
+        dataset.lengths = torch.full((len(dataset),), args.seq_len, dtype=torch.long)
 
         def collate_fn(batch):
             X, y = zip(*batch)
@@ -124,11 +163,21 @@ def train_classifier(args):
         if AutoTokenizer is None:
             raise ImportError("Please install transformers: pip install transformers")
 
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
         dataset, num_classes = get_hf_dataset(
-            args.dataset, tokenizer=tokenizer, max_len=args.seq_len, split="train"
+            args.dataset,
+            tokenizer=tokenizer,
+            max_len=args.seq_len,
+            split="train",
+            limit=args.hf_limit,
         )
         vocab_size = tokenizer.vocab_size
+
+        max_length = getattr(tokenizer, "model_max_length", None)
+        if max_length and max_length < 1e9 and args.seq_len > max_length:
+            print(
+                f"Warning: seq_len {args.seq_len} exceeds tokenizer.model_max_length {max_length}."
+            )
 
         def collate_fn(batch):
             input_ids = torch.stack([item["input_ids"] for item in batch])
@@ -142,6 +191,15 @@ def train_classifier(args):
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn
     )
+
+    if hasattr(dataset, "lengths") and dataset.lengths is not None:
+        lengths = dataset.lengths.to(torch.float32)
+        avg_len = float(lengths.mean().item())
+        max_len = float(lengths.max().item())
+        pct_full = float((lengths == args.seq_len).float().mean().item()) * 100.0
+        print(
+            f"Dataset stats -> avg_len={avg_len:.1f}, max_len={max_len:.1f}, pct_at_max={pct_full:.1f}%"
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SwitchClassifier(
@@ -162,9 +220,13 @@ def train_classifier(args):
         init_scale=args.init_scale,
         switch_dropout=args.switch_dropout,
         z_loss_coef=args.z_loss_coef,
+        distributed_strategy=args.distributed_strategy,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    use_amp = args.use_amp and device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp)
 
     if Adafactor is None or AdafactorSchedule is None:
         raise ImportError(
@@ -181,9 +243,26 @@ def train_classifier(args):
         warmup_init=use_relative_step,
         weight_decay=args.weight_decay,
     )
-    scheduler = AdafactorSchedule(optimizer) if use_relative_step else None
+    if use_relative_step:
+        scheduler = AdafactorSchedule(optimizer)
+    elif args.warmup_steps > 0:
+        scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min(1.0, (step + 1) / float(args.warmup_steps)),
+        )
+    else:
+        scheduler = None
+
+    ema = (
+        ExponentialMovingAverage(model, args.ema_decay) if args.ema_decay > 0 else None
+    )
 
     history_loss, history_acc = [], []
+    routing_drop_sum = 0.0
+    routing_load_std_sum = 0.0
+    routing_capacity_sum = 0.0
+    routing_records = 0
+    global_step = 0
 
     for epoch in range(args.epochs):
         model.train()
@@ -195,22 +274,50 @@ def train_classifier(args):
         )
         for batch in batch_iter:
             input_ids, attention_mask, labels = [b.to(device) for b in batch]
-            logits, aux_loss = model(input_ids, attention_mask=attention_mask)
-
-            cls_loss = criterion(logits, labels)
-            loss = cls_loss + aux_loss
-
             optimizer.zero_grad()
-            loss.backward()
-            if args.grad_clip > 0:
-                clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            with autocast(enabled=use_amp):
+                logits, aux_loss = model(input_ids, attention_mask=attention_mask)
+                cls_loss = criterion(logits, labels)
+                loss = cls_loss + aux_loss
+
+            loss_value = loss.detach().item()
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip > 0:
+                    clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+
             if scheduler is not None:
                 scheduler.step()
 
-            total_loss += loss.item() * input_ids.size(0)
+            if ema is not None and global_step >= args.ema_start_step:
+                ema.update(model)
+            global_step += 1
+
+            total_loss += loss_value * input_ids.size(0)
             preds = logits.argmax(dim=-1)
             total_acc += (preds == labels).sum().item()
+
+            layer_stats = model.latest_routing_metrics()
+            for stat in layer_stats:
+                if not stat:
+                    continue
+                routing_drop_sum += stat.get("tokens_dropped_frac", 0.0)
+                expert_load = stat.get("expert_load")
+                if expert_load is not None and expert_load.numel() > 0:
+                    routing_load_std_sum += float(expert_load.float().std().item())
+                capacity_util = stat.get("capacity_util")
+                if capacity_util is not None and capacity_util.numel() > 0:
+                    routing_capacity_sum += float(capacity_util.float().mean().item())
+                routing_records += 1
 
             if tqdm is not None:
                 batch_iter.set_postfix(loss=f"{loss.item():.4f}")
@@ -221,6 +328,21 @@ def train_classifier(args):
         history_acc.append(avg_acc)
 
         print(f"Epoch {epoch + 1}: loss={avg_loss:.4f}, acc={avg_acc:.4f}")
+
+        if routing_records > 0:
+            avg_drop = routing_drop_sum / routing_records
+            avg_load_std = routing_load_std_sum / routing_records
+            avg_capacity = routing_capacity_sum / routing_records
+            print(
+                f"Routing stats -> drop_frac={avg_drop:.4f}, load_std={avg_load_std:.4f}, capacity_util={avg_capacity:.4f}"
+            )
+        routing_drop_sum = 0.0
+        routing_load_std_sum = 0.0
+        routing_capacity_sum = 0.0
+        routing_records = 0
+
+    if ema is not None:
+        model.ema_state_dict = ema.state_dict()
 
     if plt is not None:
         plt.figure(figsize=(10, 4))
@@ -256,6 +378,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_classes", type=int, default=3)
     parser.add_argument("--num_samples", type=int, default=1000)
     parser.add_argument("--seq_len", type=int, default=16)
+    parser.add_argument("--tokenizer_name", type=str, default="bert-base-uncased")
+    parser.add_argument("--hf_limit", type=int, default=None)
 
     # model
     parser.add_argument("--d_model", type=int, default=128)
@@ -272,6 +396,13 @@ if __name__ == "__main__":
     parser.add_argument("--init_scale", type=float, default=0.1)
     parser.add_argument("--switch_dropout", type=float, default=0.1)
     parser.add_argument("--z_loss_coef", type=float, default=1e-3)
+    parser.add_argument(
+        "--distributed_strategy",
+        type=str,
+        default="none",
+        choices=["none", "all_to_all"],
+        help="MoE routing strategy across devices",
+    )
 
     # training
     parser.add_argument("--batch_size", type=int, default=32)
@@ -286,6 +417,12 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--adafactor_clip_threshold", type=float, default=1.0)
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument(
+        "--use_amp", action="store_true", help="Enable torch.cuda.amp mixed precision"
+    )
+    parser.add_argument("--ema_decay", type=float, default=0.0)
+    parser.add_argument("--ema_start_step", type=int, default=100)
 
     args = parser.parse_args()
     train_classifier(args)

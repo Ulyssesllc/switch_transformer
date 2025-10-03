@@ -10,7 +10,7 @@ Supports:
 
 from torch.utils.data import Dataset, TensorDataset
 import torch
-from typing import Tuple
+from typing import Tuple, Optional
 
 try:
     from datasets import load_dataset  # type: ignore
@@ -19,10 +19,13 @@ except ImportError:
 
 
 class TextClassificationDataset(Dataset):
-    def __init__(self, encodings, labels, texts=None):
+    def __init__(self, encodings, labels, texts=None, lengths=None):
         self.encodings = encodings
         self.labels = labels
         self.texts = texts
+        self.lengths = (
+            torch.tensor(lengths, dtype=torch.long) if lengths is not None else None
+        )
 
     def __len__(self):
         return len(self.labels)
@@ -32,6 +35,8 @@ class TextClassificationDataset(Dataset):
         item["labels"] = torch.tensor(self.labels[idx])
         if self.texts is not None:
             item["text"] = self.texts[idx]
+        if self.lengths is not None:
+            item["length"] = int(self.lengths[idx].item())
         return item
 
 
@@ -47,7 +52,12 @@ def _normalize_name(name: str) -> str:
 
 
 def get_hf_dataset(
-    name="ag_news", tokenizer=None, max_len=64, split="train"
+    name="ag_news",
+    tokenizer=None,
+    max_len=64,
+    split="train",
+    limit: Optional[int] = None,
+    clean_text: bool = True,
 ) -> Tuple[Dataset, int]:
     if load_dataset is None:
         raise ImportError("Please install `datasets` library: pip install datasets")
@@ -85,6 +95,20 @@ def get_hf_dataset(
         labels = list(ds["label"])
         num_classes = 2
 
+    if clean_text:
+        filtered = [
+            (text.strip(), label)
+            for text, label in zip(texts, labels)
+            if isinstance(text, str) and text.strip()
+        ]
+        if filtered:
+            texts, labels = zip(*filtered)
+            texts, labels = list(texts), list(labels)
+
+    if limit is not None:
+        texts = texts[:limit]
+        labels = labels[:limit]
+
     encodings = tokenizer(
         texts,
         truncation=True,
@@ -92,5 +116,11 @@ def get_hf_dataset(
         max_length=max_len,
         return_attention_mask=True,
     )
-    dataset = TextClassificationDataset(encodings, labels, texts=texts)
+    attention = encodings["attention_mask"]
+    if isinstance(attention, torch.Tensor):
+        lengths = attention.sum(dim=1).tolist()
+    else:
+        lengths = [int(sum(mask)) for mask in attention]
+
+    dataset = TextClassificationDataset(encodings, labels, texts=texts, lengths=lengths)
     return dataset, num_classes

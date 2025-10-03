@@ -25,6 +25,7 @@ def run_inference(args):
         )
         num_classes = args.num_classes
         vocab_size = args.vocab_size
+        dataset.lengths = torch.full((len(dataset),), args.seq_len, dtype=torch.long)
 
         def collate_fn(batch):
             X, y = zip(*batch)
@@ -38,11 +39,21 @@ def run_inference(args):
         if AutoTokenizer is None:
             raise ImportError("Please install transformers: pip install transformers")
 
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
         dataset, num_classes = get_hf_dataset(
-            args.dataset, tokenizer=tokenizer, max_len=args.seq_len, split="test"
+            args.dataset,
+            tokenizer=tokenizer,
+            max_len=args.seq_len,
+            split="test",
+            limit=args.hf_limit,
         )
         vocab_size = tokenizer.vocab_size
+
+        max_length = getattr(tokenizer, "model_max_length", None)
+        if max_length and max_length < 1e9 and args.seq_len > max_length:
+            print(
+                f"Warning: seq_len {args.seq_len} exceeds tokenizer.model_max_length {max_length}."
+            )
 
         def collate_fn(batch):
             input_ids = torch.stack([item["input_ids"] for item in batch])
@@ -57,6 +68,15 @@ def run_inference(args):
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn
     )
+
+    if hasattr(dataset, "lengths") and dataset.lengths is not None:
+        lengths = dataset.lengths.to(torch.float32)
+        avg_len = float(lengths.mean().item())
+        max_len = float(lengths.max().item())
+        pct_full = float((lengths == args.seq_len).float().mean().item()) * 100.0
+        print(
+            f"Dataset stats -> avg_len={avg_len:.1f}, max_len={max_len:.1f}, pct_at_max={pct_full:.1f}%"
+        )
 
     # model
     model = SwitchClassifier(
@@ -77,6 +97,7 @@ def run_inference(args):
         init_scale=args.init_scale,
         switch_dropout=args.switch_dropout,
         z_loss_coef=args.z_loss_coef,
+        distributed_strategy=args.distributed_strategy,
     ).to(device)
 
     if args.ckpt is not None:
@@ -117,6 +138,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_classes", type=int, default=3)
     parser.add_argument("--num_samples", type=int, default=1000)
     parser.add_argument("--seq_len", type=int, default=16)
+    parser.add_argument("--tokenizer_name", type=str, default="bert-base-uncased")
+    parser.add_argument("--hf_limit", type=int, default=None)
 
     # model
     parser.add_argument("--d_model", type=int, default=128)
@@ -133,6 +156,13 @@ if __name__ == "__main__":
     parser.add_argument("--init_scale", type=float, default=0.1)
     parser.add_argument("--switch_dropout", type=float, default=0.1)
     parser.add_argument("--z_loss_coef", type=float, default=1e-3)
+    parser.add_argument(
+        "--distributed_strategy",
+        type=str,
+        default="none",
+        choices=["none", "all_to_all"],
+        help="MoE routing strategy across devices",
+    )
 
     # inference
     parser.add_argument("--batch_size", type=int, default=4)
