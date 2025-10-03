@@ -71,9 +71,12 @@ def run_inference(args):
         dropout=args.dropout,
         expert_dropout=args.expert_dropout,
         capacity_factor=args.capacity_factor,
+        capacity_factor_eval=args.capacity_factor_eval,
         router_noise_eps=args.router_noise_eps,
         aux_loss_coef=args.aux_loss_coef,
         init_scale=args.init_scale,
+        switch_dropout=args.switch_dropout,
+        z_loss_coef=args.z_loss_coef,
     ).to(device)
 
     if args.ckpt is not None:
@@ -124,9 +127,12 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--expert_dropout", type=float, default=0.0)
     parser.add_argument("--capacity_factor", type=float, default=1.0)
+    parser.add_argument("--capacity_factor_eval", type=float, default=2.0)
     parser.add_argument("--router_noise_eps", type=float, default=1e-2)
     parser.add_argument("--aux_loss_coef", type=float, default=1e-2)
     parser.add_argument("--init_scale", type=float, default=0.1)
+    parser.add_argument("--switch_dropout", type=float, default=0.1)
+    parser.add_argument("--z_loss_coef", type=float, default=1e-3)
 
     # inference
     parser.add_argument("--batch_size", type=int, default=4)

@@ -18,6 +18,8 @@ Features implemented:
 """
 
 import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,20 +43,30 @@ class SwitchFFN(nn.Module):
         d_ff: int,
         num_experts: int = 4,
         capacity_factor: float = 1.0,
+        eval_capacity_factor: Optional[float] = None,
         expert_dropout: float = 0.0,
         router_noise_eps: float = 1e-2,
         alpha: float = 1e-2,
         init_scale: float = 0.1,
+        switch_dropout: float = 0.1,
+        z_loss_coef: float = 1e-3,
     ):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
         self.num_experts = num_experts
         self.capacity_factor = capacity_factor
+        self.eval_capacity_factor = (
+            eval_capacity_factor
+            if eval_capacity_factor is not None
+            else capacity_factor
+        )
         self.expert_dropout = expert_dropout
         self.router_noise_eps = router_noise_eps
         self.alpha = alpha
         self.init_scale = init_scale
+        self.switch_dropout = nn.Dropout(switch_dropout)
+        self.z_loss_coef = z_loss_coef
 
         # Router: token -> logits over experts
         self.router = nn.Linear(d_model, num_experts, bias=False)
@@ -88,12 +100,11 @@ class SwitchFFN(nn.Module):
         E = self.num_experts
 
         # Router logits with optional noise
-        router_logits = self.router(tokens)
+        router_input = self.switch_dropout(tokens)
+        router_logits = self.router(router_input)
         if is_training and self.router_noise_eps > 0:
-            noise = (torch.rand_like(router_logits) * (2 * self.router_noise_eps)) + (
-                1 - self.router_noise_eps
-            )
-            router_logits = router_logits * noise
+            noise = torch.randn_like(router_logits) * self.router_noise_eps
+            router_logits = router_logits + noise
 
         router_probs = F.softmax(router_logits.to(torch.float32), dim=-1)
 
@@ -107,8 +118,16 @@ class SwitchFFN(nn.Module):
         Pi = router_probs.mean(dim=0)
         aux_loss = self.alpha * E * torch.dot(fi.to(Pi.dtype), Pi)
 
+        # z-loss to stabilize router logits
+        if self.z_loss_coef > 0:
+            z_loss = torch.square(torch.logsumexp(router_logits, dim=-1)).mean()
+            aux_loss = aux_loss + self.z_loss_coef * z_loss
+
         # Capacity per expert
-        expert_capacity = int((T / float(E)) * self.capacity_factor)
+        capacity_factor = (
+            self.capacity_factor if is_training else self.eval_capacity_factor
+        )
+        expert_capacity = int(math.ceil((T / float(E)) * capacity_factor))
         expert_capacity = max(expert_capacity, 1)
 
         # Dispatch tokens

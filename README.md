@@ -6,6 +6,7 @@ Bring the routing magic of Switch Transformers to lightweight text classificatio
 
 ## 🌟 Highlights
 - **Switch-style MoE** encoder with configurable expert count, routing noise, and auxiliary load-balancing loss.
+- **T5-inspired attention stack** using RMSNorm and relative position bias (no absolute positional embeddings).
 - **Toy dataset generator** for instant experimentation without external downloads.
 - **Plug-and-play HuggingFace integration** for `ag_news` and `sst2` (GLUE) with attention masks and raw text preservation.
 - **Matplotlib visualizations**—automatic loss/accuracy curves saved as `training_curve.png` when the library is available.
@@ -69,9 +70,9 @@ switch_transformer/
 ---
 
 ## 🧠 Model overview
-- Multi-head self-attention encoder layers (`model/transformer.py`).
-- Switch Feed-Forward Network (`model/switch_ffn.py`) with top-1 expert routing, capacity factor, expert dropout, and auxiliary loss.
-- Position + token embeddings with configurable maximum length.
+- Multi-head self-attention encoder layers (`model/transformer.py`) with relative position bias and RMSNorm.
+- Switch Feed-Forward Network (`model/switch_ffn.py`) with top-1 expert routing, capacity factor, expert dropout, SwitchDrop, and auxiliary losses (load-balance + z-loss).
+- Token embeddings only (no absolute positions); temporal information flows through the relative bias module.
 - Classification head that pools token representations with or without attention masks.
 
 ---
@@ -91,6 +92,7 @@ python train.py --dataset ag_news --seq_len 128 --batch_size 32 --epochs 3
 Artifacts:
 - `training_curve.png` (if matplotlib is installed).
 - Standard output logs with loss/accuracy per epoch.
+> Optimization uses Adafactor with a relative-step schedule (requires `transformers>=4.0.0`).
 
 ### Key CLI switches (training)
 | Argument | Default | Description |
@@ -101,9 +103,17 @@ Artifacts:
 | `--num_layers` | `2` | Number of Transformer blocks. |
 | `--num_heads` | `4` | Attention heads per block. |
 | `--num_experts` | `2` | Experts per SwitchFFN layer. |
-| `--capacity_factor` | `1.0` | Capacity multiplier for token routing. |
-| `--router_noise_eps` | `1e-2` | Multiplicative noise injected into router logits during training. |
-| `--aux_loss_coef` | `1e-2` | Balancing coefficient for the auxiliary routing loss. |
+| `--capacity_factor` | `1.0` | Capacity multiplier for token routing during training. |
+| `--capacity_factor_eval` | `2.0` | Higher routing capacity used for evaluation/inference. |
+| `--router_noise_eps` | `1e-2` | Additive Gaussian noise injected into router logits during training. |
+| `--aux_loss_coef` | `1e-2` | Load-balancing loss coefficient. |
+| `--switch_dropout` | `0.1` | Dropout applied to router inputs ("SwitchDrop"). |
+| `--z_loss_coef` | `1e-3` | Router z-loss stabilizer. |
+| `--label_smoothing` | `0.1` | Cross-entropy label smoothing factor. |
+| `--grad_clip` | `1.0` | Global gradient clipping threshold (L2 norm). |
+| `--weight_decay` | `0.0` | Weight decay applied by Adafactor. |
+| `--adafactor_clip_threshold` | `1.0` | Internal Adafactor gradient clipping threshold. |
+| `--lr` | `None` | Provide a value to disable relative-step Adafactor and use a fixed LR. |
 
 ---
 
@@ -128,13 +138,16 @@ Outputs show true vs. predicted labels and the first 60 characters of the origin
 | `--num_samples` | `1000` | Toy dataset size if `--dataset toy`. |
 | `--num_classes` | `3` | Toy dataset class count. |
 | `--vocab_size` | `500` | Toy dataset vocabulary size. |
+| `--capacity_factor_eval` | `2.0` | Router capacity multiplier during inference. |
+| `--switch_dropout` | `0.1` | Router dropout kept consistent with training. |
+| `--z_loss_coef` | `1e-3` | Router z-loss coefficient (match training). |
 
 ---
 
 ## 🧪 Validation commands
 The repository was last smoke-tested with:
 ```bash
-python train.py --dataset toy --epochs 1 --batch_size 4 --num_samples 32
+python train.py --dataset toy --epochs 1 --batch_size 2 --num_samples 8
 python infer.py --dataset toy --num_samples 4 --batch_size 2
 ```
 Both commands succeed on CPU, creating `training_curve.png` and printing prediction samples.

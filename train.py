@@ -1,8 +1,8 @@
 import argparse
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
 
 try:
     import matplotlib
@@ -20,6 +20,12 @@ try:
     from transformers import AutoTokenizer
 except ImportError:
     AutoTokenizer = None
+
+try:
+    from transformers.optimization import Adafactor, AdafactorSchedule
+except ImportError:
+    Adafactor = None
+    AdafactorSchedule = None
 
 try:
     from tqdm.auto import tqdm
@@ -41,14 +47,16 @@ class SwitchClassifier(nn.Module):
         dropout: float = 0.1,
         expert_dropout: float = 0.0,
         capacity_factor: float = 1.0,
+        capacity_factor_eval: float = 2.0,
         router_noise_eps: float = 1e-2,
         aux_loss_coef: float = 1e-2,
         init_scale: float = 0.1,
+        switch_dropout: float = 0.1,
+        z_loss_coef: float = 1e-3,
     ):
         super().__init__()
         self.d_model = d_model
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_len, d_model)
         self.dropout = nn.Dropout(dropout)
 
         self.encoder = TransformerEncoder(
@@ -60,21 +68,20 @@ class SwitchClassifier(nn.Module):
             dropout=dropout,
             expert_dropout=expert_dropout,
             capacity_factor=capacity_factor,
+            eval_capacity_factor=capacity_factor_eval,
             router_noise_eps=router_noise_eps,
             aux_loss_coef=aux_loss_coef,
             init_scale=init_scale,
+            max_relative_distance=max_len,
+            switch_dropout=switch_dropout,
+            z_loss_coef=z_loss_coef,
         )
 
         self.classifier = nn.Linear(d_model, num_classes)
 
     def forward(self, input_ids, attention_mask=None, is_training=True):
         B, T = input_ids.size()
-        pos = (
-            torch.arange(0, T, dtype=torch.long, device=input_ids.device)
-            .unsqueeze(0)
-            .expand(B, T)
-        )
-        x = self.token_emb(input_ids) + self.pos_emb(pos)
+        x = self.token_emb(input_ids)
         x = self.dropout(x)
 
         mask = (
@@ -149,13 +156,32 @@ def train_classifier(args):
         dropout=args.dropout,
         expert_dropout=args.expert_dropout,
         capacity_factor=args.capacity_factor,
+        capacity_factor_eval=args.capacity_factor_eval,
         router_noise_eps=args.router_noise_eps,
         aux_loss_coef=args.aux_loss_coef,
         init_scale=args.init_scale,
+        switch_dropout=args.switch_dropout,
+        z_loss_coef=args.z_loss_coef,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    if Adafactor is None or AdafactorSchedule is None:
+        raise ImportError(
+            "Please install transformers>=4.0.0 to use the Adafactor optimizer: pip install transformers"
+        )
+
+    use_relative_step = args.lr is None
+    optimizer = Adafactor(
+        model.parameters(),
+        lr=None if use_relative_step else args.lr,
+        clip_threshold=args.adafactor_clip_threshold,
+        relative_step=use_relative_step,
+        scale_parameter=use_relative_step,
+        warmup_init=use_relative_step,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = AdafactorSchedule(optimizer) if use_relative_step else None
 
     history_loss, history_acc = [], []
 
@@ -176,7 +202,11 @@ def train_classifier(args):
 
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             total_loss += loss.item() * input_ids.size(0)
             preds = logits.argmax(dim=-1)
@@ -236,14 +266,26 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--expert_dropout", type=float, default=0.0)
     parser.add_argument("--capacity_factor", type=float, default=1.0)
+    parser.add_argument("--capacity_factor_eval", type=float, default=2.0)
     parser.add_argument("--router_noise_eps", type=float, default=1e-2)
     parser.add_argument("--aux_loss_coef", type=float, default=1e-2)
     parser.add_argument("--init_scale", type=float, default=0.1)
+    parser.add_argument("--switch_dropout", type=float, default=0.1)
+    parser.add_argument("--z_loss_coef", type=float, default=1e-3)
 
     # training
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Absolute learning rate (set to override Adafactor relative step)",
+    )
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--adafactor_clip_threshold", type=float, default=1.0)
 
     args = parser.parse_args()
     train_classifier(args)
